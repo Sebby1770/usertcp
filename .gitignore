@@ -1,0 +1,19 @@
+# build artifacts
+*.o
+*.a
+*.so
+*.dylib
+/usertcp
+
+# editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# packet captures
+*.pcap
+*.pcapng
