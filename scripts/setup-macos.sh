@@ -11,7 +11,13 @@
 
 set -eu
 
-IF=${1:?usage: $0 utunN [local] [peer]}
+if [[ -z "${1:-}" || "${1:-}" == "utunN" ]]; then
+  echo "usage: $0 <utunN> [local] [peer]" >&2
+  echo "       start ./usertcp first; copy the utunN name it prints." >&2
+  exit 1
+fi
+
+IF=$1
 LOCAL=${2:-10.0.0.1}
 PEER=${3:-10.0.0.2}
 

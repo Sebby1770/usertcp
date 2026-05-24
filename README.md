@@ -37,15 +37,24 @@ expected; milestone 1 is when it starts replying.
 
 ### macOS
 
+The utun control socket requires root, so the program must run with
+**sudo**:
+
 ```sh
-./usertcp                                       # in one shell;
-                                                # note the utunN it prints
-./scripts/setup-macos.sh utunN 10.0.0.1 10.0.0.2  # in another shell
+sudo ./usertcp
+```
+
+It will print the actual `utunN` name the kernel assigned, plus the
+exact two `ifconfig`/`route` commands to bring it up — copy them into
+another shell as-is. Then in any shell:
+
+```sh
 ping 10.0.0.2
 ```
 
-macOS assigns the utun number when the program connects, so the bring-up
-script has to run *after* the program starts.
+Each ICMP echo request will appear as a hex dump in the first shell.
+`ping` itself will keep timing out — nothing replies yet, that's
+milestone 1.
 
 ## What you'll see
 

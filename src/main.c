@@ -35,11 +35,35 @@ int main(int argc, char **argv) {
     int fd = tun_open(ifname, sizeof(ifname));
     if (fd < 0) {
         fprintf(stderr, "tun_open: %s\n", strerror(errno));
-        fprintf(stderr, "hint: on Linux run scripts/setup-linux.sh first.\n");
+#if defined(__APPLE__)
+        if (errno == EPERM)
+            fprintf(stderr,
+                    "hint: macOS utun requires root. try: sudo ./usertcp\n");
+#else
+        if (errno == EPERM || errno == EACCES)
+            fprintf(stderr,
+                    "hint: run scripts/setup-linux.sh first to create a "
+                    "persistent tun owned by you.\n");
+#endif
         return 1;
     }
+
     fprintf(stderr, "opened tun device: %s (fd=%d)\n", ifname, fd);
-    fprintf(stderr, "press Ctrl-C to quit. now send some traffic (e.g. ping).\n\n");
+#if defined(__APPLE__)
+    fprintf(stderr,
+            "\n  in another terminal, bring the interface up:\n"
+            "    sudo ifconfig %s 10.0.0.1 10.0.0.2 up\n"
+            "    sudo route -nq add -net 10.0.0.0/24 -interface %s\n"
+            "\n  then send some traffic:\n"
+            "    ping 10.0.0.2\n"
+            "\n  press Ctrl-C to quit.\n\n",
+            ifname, ifname);
+#else
+    fprintf(stderr,
+            "\n  if you haven't already, run scripts/setup-linux.sh.\n"
+            "  then in another terminal: ping 10.0.0.2\n"
+            "\n  press Ctrl-C to quit.\n\n");
+#endif
 
     unsigned char buf[2048];
     unsigned long packet_no = 0;
