@@ -4,17 +4,66 @@ A user-space TCP/IP stack written from scratch in C, on top of a TUN
 device. A learning project: the goal is to understand what every kernel
 TCP implementation does, by writing one.
 
-**Status:** Milestone 0 — TUN device read loop. The program opens a TUN
-on Linux or macOS and hex-dumps every IP packet that arrives. No parsing
-yet; that starts at milestone 1.
+**Status:** the stack answers `ping`, echoes UDP, completes the full TCP
+lifecycle (3-way handshake → reliable data transfer → teardown with
+TIME_WAIT), and serves HTTP/1.0 — all framed by hand from the IP header up.
+Everything below the TUN glue is unit-tested on the host without root.
 
-The full project roadmap (12 milestones, ending in HTTPS served from the
-custom stack) is in [docs/roadmap.md](docs/roadmap.md).
+```
+ping 10.0.0.2          # ICMP echo reply
+nc -u 10.0.0.2 7       # UDP echo
+nc 10.0.0.2 9999       # TCP echo
+curl http://10.0.0.2/  # HTTP/1.0 served straight off the stack
+```
+
+The full project roadmap (12 milestones, ending in HTTPS) is in
+[docs/roadmap.md](docs/roadmap.md).
+
+## What's implemented
+
+| Layer | Done |
+|---|---|
+| **IPv4** | header parse + validation, checksum verify/generate, addressed-to-us filtering, fragment drop |
+| **ICMP** | echo request → echo reply (`ping` works) |
+| **UDP** | demux by port, pseudo-header checksum, echo server on port 7 |
+| **TCP** | passive open (SYN/SYN-ACK/ACK), in-order reliable data, sliding send window honoring the peer's advertised window, Go-Back-N retransmission, RFC 6298 RTO with Karn's algorithm, full close (FIN_WAIT_1/2, CLOSING, TIME_WAIT, CLOSE_WAIT, LAST_ACK), RST generation for unmatched segments, multi-connection demux by 4-tuple |
+| **Apps** | TCP echo, HTTP/1.0 `GET` server |
+
+Not yet (see roadmap): congestion control (Reno), SACK, window scaling,
+out-of-order reassembly, active open / sockets API, IPv6, TLS.
+
+## Architecture
+
+The protocol core is deliberately transport-agnostic. `stack_input()`
+consumes one inbound IPv4 packet; an output callback emits one outbound
+IPv4 packet. `main.c` wires those to a TUN device; the test harness wires
+them to in-memory buffers — so the entire stack is exercisable without a
+TUN or root.
+
+```
+            ┌───────────────┐
+ TUN fd ───▶│  stack_input  │──▶ IPv4 ─┬─▶ ICMP ─▶ echo reply
+            └───────────────┘          ├─▶ UDP  ─▶ port table ─▶ app
+            ┌───────────────┐          └─▶ TCP  ─▶ 4-tuple TCB ─▶ app
+ TUN fd ◀───│ output(pkt)   │◀───────────────────────────────────┘
+            └───────────────┘
+```
+
+| File | Responsibility |
+|---|---|
+| `src/net.{h,c}` | wire-format structs, internet + pseudo-header checksums, 32-bit serial-number arithmetic |
+| `src/stack.{h,c}` | IPv4 parse/dispatch, ICMP echo, UDP, the shared IP-send path |
+| `src/tcp.{h,c}` | the TCP state machine, send/receive paths, RTO timers |
+| `src/app.{h,c}` | demo apps: UDP echo, TCP echo, HTTP/1.0 |
+| `src/tun.{h,c}` | Linux + macOS TUN open/read/write |
+| `src/main.c` | event loop: `poll()` the TUN, feed the stack, tick timers |
+| `tests/test_stack.c` | host-side protocol tests (no root) |
 
 ## Building
 
 ```sh
-make
+make        # build ./usertcp
+make test   # build and run the host-side protocol tests (no root needed)
 ```
 
 Only standard libc + POSIX. No external dependencies.
@@ -26,100 +75,61 @@ Only standard libc + POSIX. No external dependencies.
 ```sh
 ./scripts/setup-linux.sh   # one-time: create tun0, assign 10.0.0.1/24
 ./usertcp tun0             # in one shell
-
-# in another shell:
-ping 10.0.0.2
 ```
-
-You'll see hex dumps of the ICMP echo request packets. There's nothing
-listening on 10.0.0.2 yet, so `ping` will just time out — that's
-expected; milestone 1 is when it starts replying.
 
 ### macOS
 
-The utun control socket requires root, so the program must run with
-**sudo**:
+The utun control socket requires root:
 
 ```sh
 sudo ./usertcp
 ```
 
-It will print the actual `utunN` name the kernel assigned, plus the
-exact two `ifconfig`/`route` commands to bring it up — copy them into
-another shell as-is. Then in any shell:
+It prints the `utunN` name the kernel assigned plus the exact
+`ifconfig`/`route` commands to bring it up — copy them into another shell.
+
+### Then, from any shell
 
 ```sh
-ping 10.0.0.2
+ping 10.0.0.2             # replies now, instead of timing out
+nc -u 10.0.0.2 7          # type a line, watch it bounce
+nc 10.0.0.2 9999          # TCP echo
+curl -v http://10.0.0.2/  # a page served by the stack itself
 ```
 
-Each ICMP echo request will appear as a hex dump in the first shell.
-`ping` itself will keep timing out — nothing replies yet, that's
-milestone 1.
+## Testing
 
-## What you'll see
+`make test` runs `tests/test_stack.c`, which redirects the stack's output
+into an in-memory capture queue, pushes crafted packets through
+`stack_input()`, and checks every emitted packet field by field — the same
+idea as `packetdrill`, scoped down to one self-contained C file. It covers:
 
-Each incoming packet prints as:
+- the internet checksum (incl. the RFC 1071 worked example) and 32-bit
+  sequence arithmetic across the wraparound point
+- ICMP echo (address swap, checksum, id/seq echoed)
+- UDP echo (pseudo-header checksum, payload round-trip)
+- TCP: RST to a closed port, then the full SYN → SYN-ACK → ACK → data echo
+  → FIN lifecycle with sequence-number bookkeeping verified at each step
+- a corrupt IP checksum being dropped
 
-```
-packet #1  len=84
-  0000  45 00 00 54 00 00 40 00  40 01 a8 a3 0a 00 00 01  |E..T..@.@.......|
-  0010  0a 00 00 02 08 00 ...
-```
-
-The leading `45` is your first IPv4 header — `4` is the version, `5` is
-the header length in 32-bit words (5 × 4 = 20 bytes). Already enough to
-start parsing if you wanted to peek ahead.
-
-## Layout
-
-```
-.
-├── src/
-│   ├── main.c   # entry point: open TUN, read loop, hexdump
-│   ├── tun.h    # TUN open/read/write interface
-│   └── tun.c    # Linux + macOS implementations
-├── scripts/
-│   ├── setup-linux.sh
-│   └── setup-macos.sh
-├── docs/
-│   └── roadmap.md
-├── Makefile
-├── LICENSE      # MIT
-└── README.md
-```
-
-## Roadmap (high level)
-
-0. **TUN read loop** ← current
-1. IPv4 parsing + ICMP echo (so `ping` works)
-2. UDP echo
-3. TCP three-way handshake
-4. TCP data transfer (stop-and-wait + RTO)
-5. TCP teardown (FIN dance, TIME_WAIT)
-6. Sliding window + flow control
-7. Congestion control (Reno)
-8. Multi-connection demux + sockets-like API
-9. HTTP/1.0 server over the stack
-10. TLS integration → HTTPS
-11. Observability: pcap-out, structured tracing, introspection
-
-Each milestone has its own scope, expected tests, and debugging
-workflow. See [docs/roadmap.md](docs/roadmap.md) for the full breakdown.
+Because the core has no I/O dependencies, these run in milliseconds and
+need no privileges — ideal for CI.
 
 ## Debugging toolkit
 
 - `tcpdump -i tun0 -nn -X -e` — see the kernel's view of the same packets
-- Wireshark on `tun0` — interactive packet inspection, "Follow TCP Stream"
+- Wireshark on `tun0` — interactive inspection, "Follow TCP Stream"
 - `tc qdisc add dev tun0 root netem loss 5% delay 50ms` (Linux) — inject
-  loss and latency to test reliability and congestion control
+  loss and latency to watch the RTO and retransmission paths fire
 - `ss -tinp` — Linux's view of any kernel-side TCP connections
 
 ## References
 
 - TCP/IP Illustrated, Vol. 1 (Stevens / Fall) — implementation companion
 - RFC 9293 — TCP (the modern consolidated spec)
+- RFC 1071 — computing the internet checksum
 - RFC 6298 — RTO computation
-- RFC 5681 — TCP congestion control (Reno)
+- RFC 5681 — TCP congestion control (Reno) — the next milestone
 - RFC 8446 — TLS 1.3
 
 ## License

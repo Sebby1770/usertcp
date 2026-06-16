@@ -5,6 +5,26 @@ ending in HTTPS served over the custom stack. The goal is depth of
 understanding, not features — each milestone introduces one concept and
 adds the tests + debugging workflow that proves it works.
 
+## Progress
+
+- ✅ **M0** TUN read loop
+- ✅ **M1** IPv4 parsing + ICMP echo (`ping` replies)
+- ✅ **M2** UDP echo (port 7, pseudo-header checksum)
+- ✅ **M3** TCP three-way handshake
+- ✅ **M4** TCP data transfer (reliable, RTO per RFC 6298, Karn's algorithm)
+- ✅ **M5** TCP teardown (FIN dance, TIME_WAIT)
+- 🟡 **M6** Sliding window — send-side window is implemented; receive-side
+  reassembly + window-scaling option still to do
+- ⏳ **M7** Congestion control (Reno) ← next
+- ✅ **M8** Multi-connection demux by 4-tuple (callback API; sockets-style
+  `accept()` still to do)
+- ✅ **M9** HTTP/1.0 server (`GET` → static page)
+- ⏳ **M10** TLS → HTTPS
+- ⏳ **M11** Observability (pcap-out, structured tracing)
+
+The protocol core is unit-tested on the host with no TUN and no root
+(`make test`).
+
 ## Upfront decisions
 
 - **Language:** C. Matches RFC pseudocode 1:1; no abstractions hiding
