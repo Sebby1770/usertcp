@@ -1,3 +1,8 @@
+/* Expose clock_gettime/CLOCK_MONOTONIC and poll() under strict -std=c11:
+ * glibc hides POSIX symbols unless a feature-test macro is set before any
+ * include. (macOS exposes them by default, so this only bites on Linux/CI.) */
+#define _POSIX_C_SOURCE 200809L
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <poll.h>
