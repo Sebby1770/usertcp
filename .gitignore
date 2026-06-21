@@ -3,7 +3,9 @@
 *.a
 *.so
 *.dylib
+*.dSYM/
 /usertcp
+/tests/test_stack
 
 # editor
 .vscode/
