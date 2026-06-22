@@ -8,9 +8,10 @@
 /* A from-scratch TCP implementation covering the connection lifecycle:
  * passive open (3-way handshake), reliable in-order data transfer with a
  * sliding send window and Go-Back-N retransmission, RFC 6298 RTO
- * estimation, and the full close sequence including TIME_WAIT. It is a
- * learning implementation: in-order receive only (no reassembly queue),
- * no congestion control, no options beyond the implicit 536/1400 MSS. */
+ * estimation, RFC 5681 Reno congestion control (slow start, congestion
+ * avoidance, fast retransmit + fast recovery), and the full close sequence
+ * including TIME_WAIT. It is a learning implementation: in-order receive
+ * only (no reassembly queue), no options beyond the implicit 1400 MSS. */
 
 /* RTO bounds (ms). RFC 6298 mandates a 1s minimum; we lower it so demos and
  * tests over a near-zero-RTT TUN do not stall for a full second per loss. */
@@ -165,6 +166,69 @@ static void rtt_sample(struct tcp_conn *c, uint32_t now_ms) {
     c->rto_ms = (uint32_t)rto;
 }
 
+/* ---- congestion control (RFC 5681, Reno) ---------------------------- */
+
+/* Initial window: RFC 6928 allows up to 10*MSS. ssthresh starts effectively
+ * unbounded so the connection begins in slow start. */
+#define TCP_INIT_CWND (10u * TCP_MSS)
+
+static uint32_t flight_size(const struct tcp_conn *c) {
+    return c->snd_nxt - c->snd_una; /* bytes sent but not yet acked */
+}
+
+/* Resend just the oldest unacked segment — the one the duplicate ACKs imply
+ * was lost. Unlike an RTO this does not rewind snd_nxt, so already-sent data
+ * stays "in flight" and fast recovery can clock out new segments. */
+static void tcp_retransmit_una(struct tcp_conn *c) {
+    c->rtt_timing = 0; /* Karn: never sample RTT from a retransmission */
+    uint32_t p = c->snd_una;
+    uint32_t data_end = c->snd_data_seq + (uint32_t)c->sndbuf_len;
+    if (seq_lt(p, data_end)) {
+        size_t off = (size_t)(p - c->snd_data_seq);
+        size_t avail = c->sndbuf_len - off;
+        size_t chunk = avail < TCP_MSS ? avail : TCP_MSS;
+        tcp_output(c, p, TCP_ACK | TCP_PSH, c->sndbuf + off, chunk);
+    } else if (c->fin_sent && p == c->fin_seq) {
+        tcp_output(c, p, TCP_ACK | TCP_FIN, NULL, 0);
+    }
+    rto_arm(c);
+}
+
+/* A new ACK grew snd_una by `acked` bytes. */
+static void cc_on_new_ack(struct tcp_conn *c, uint32_t acked) {
+    if (c->in_fast_recovery) {
+        /* Full ACK ends recovery: deflate the window back to ssthresh. */
+        c->in_fast_recovery = 0;
+        c->cwnd = c->ssthresh;
+        c->dup_acks = 0;
+        return;
+    }
+    c->dup_acks = 0;
+    if (c->cwnd < c->ssthresh) {
+        /* Slow start: +MSS per ACK (bounded by bytes actually acked). */
+        c->cwnd += acked < TCP_MSS ? acked : TCP_MSS;
+    } else {
+        /* Congestion avoidance: roughly +MSS per RTT. */
+        uint32_t inc = (uint32_t)TCP_MSS * TCP_MSS / c->cwnd;
+        c->cwnd += inc ? inc : 1;
+    }
+}
+
+/* A duplicate ACK (no new data acked, data still in flight). */
+static void cc_on_dup_ack(struct tcp_conn *c) {
+    c->dup_acks++;
+    if (c->dup_acks == 3 && !c->in_fast_recovery) {
+        uint32_t half = flight_size(c) / 2;
+        c->ssthresh = half > 2u * TCP_MSS ? half : 2u * TCP_MSS;
+        c->cwnd = c->ssthresh + 3u * TCP_MSS; /* inflate for the 3 dup ACKs */
+        c->in_fast_recovery = 1;
+        c->recover = c->snd_nxt;
+        tcp_retransmit_una(c); /* fast retransmit, before the RTO fires */
+    } else if (c->in_fast_recovery) {
+        c->cwnd += TCP_MSS; /* each further dup ACK clocks out one segment */
+    }
+}
+
 /* ---- send path ------------------------------------------------------ */
 
 /* Emit every segment the window now permits: a pending SYN-ACK, buffered
@@ -173,7 +237,10 @@ static void rtt_sample(struct tcp_conn *c, uint32_t now_ms) {
 static void tcp_send_pending(struct tcp_conn *c) {
     for (;;) {
         uint32_t p = c->snd_nxt;
-        uint32_t window = c->snd_wnd ? c->snd_wnd : 1; /* 1 = zero-window probe */
+        /* RFC 5681: the sender may have at most min(cwnd, rwnd) bytes in
+         * flight. (1 = zero-window probe so a closed window can't deadlock.) */
+        uint32_t cong = c->snd_wnd < c->cwnd ? c->snd_wnd : c->cwnd;
+        uint32_t window = cong ? cong : 1;
         uint32_t win_end = c->snd_una + window;
 
         if (c->state == TCP_SYN_RCVD && p == c->iss) {
@@ -362,21 +429,21 @@ static void segment_arrives(struct tcp_conn *c, uint32_t seq, uint32_t ack,
             tcp_output(c, c->snd_nxt, TCP_ACK, NULL, 0);
             return;
         }
-        if (seq_ge(ack, c->snd_una)) {
+        uint32_t old_una = c->snd_una;
+        if (seq_gt(ack, c->snd_una)) {
             int syn_acked = 0, fin_acked = 0;
-            int advanced = seq_gt(ack, c->snd_una);
-            if (advanced)
-                ack_update(c, ack, &syn_acked, &fin_acked);
+            ack_update(c, ack, &syn_acked, &fin_acked);
             c->snd_wnd = wnd;
+            cc_on_new_ack(c, ack - old_una);
 
-            if (advanced && c->rtt_timing && seq_ge(ack, c->rtt_seq)) {
+            if (c->rtt_timing && seq_ge(ack, c->rtt_seq)) {
                 rtt_sample(c, c->stack->now_ms);
                 c->rtt_timing = 0;
             }
 
             if (c->snd_una == c->snd_nxt)
                 rto_stop(c);
-            else if (advanced)
+            else
                 rto_arm(c); /* fresh data acked: restart timer */
 
             /* State transitions driven by what just got acknowledged. */
@@ -405,8 +472,16 @@ static void segment_arrives(struct tcp_conn *c, uint32_t seq, uint32_t ack,
                     break;
                 }
             }
+        } else if (ack == c->snd_una) {
+            /* No new data acked. Still track the peer's window, and treat a
+             * bare data-less ACK with data in flight as a duplicate ACK —
+             * the fast-retransmit loss signal (RFC 5681). */
+            c->snd_wnd = wnd;
+            if (c->snd_una != c->snd_nxt && dlen == 0 &&
+                !(flags & (TCP_SYN | TCP_FIN)))
+                cc_on_dup_ack(c);
         }
-        /* else: duplicate/old ACK — ignore (no fast retransmit here). */
+        /* else: stale ACK below snd_una — ignore. */
     }
 
     deliver_segment(c, flags, seq, data, dlen);
@@ -472,6 +547,9 @@ void tcp_input(struct stack *s, uint32_t src, uint32_t dst,
         c->snd_data_seq = c->iss + 1;
         c->snd_wnd = wnd;
         c->rto_ms = RTO_INITIAL_MS;
+        c->cwnd = TCP_INIT_CWND;     /* start in slow start (RFC 6928 IW10) */
+        c->ssthresh = 0xffffffffu;   /* unbounded until the first loss */
+        c->recover = c->iss;
         tcp_send_pending(c); /* emits SYN-ACK */
         return;
     }
@@ -501,6 +579,17 @@ void tcp_tick(struct stack *s, uint32_t now_ms) {
             if (c->rto_ms > RTO_MAX_MS)
                 c->rto_ms = RTO_MAX_MS;
             c->rtt_timing = 0;
+
+            /* An RTO is the strongest loss signal: halve ssthresh and drop
+             * cwnd to one segment, restarting slow start (RFC 5681). */
+            if (c->cwnd) {
+                uint32_t half = flight_size(c) / 2;
+                c->ssthresh = half > 2u * TCP_MSS ? half : 2u * TCP_MSS;
+                c->cwnd = TCP_MSS;
+                c->dup_acks = 0;
+                c->in_fast_recovery = 0;
+            }
+
             c->snd_nxt = c->snd_una;
             c->rto_running = 0;
             s->retransmits++;

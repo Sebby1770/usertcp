@@ -74,6 +74,16 @@ struct tcp_conn {
     uint32_t iss;     /* our initial send sequence number      */
     uint32_t snd_wnd; /* peer's advertised receive window      */
 
+    /* Congestion control (RFC 5681, TCP Reno). The sender is limited by
+     * min(cwnd, snd_wnd). cwnd grows in slow start until it reaches ssthresh,
+     * then more slowly in congestion avoidance; 3 duplicate ACKs trigger fast
+     * retransmit + fast recovery, and an RTO collapses cwnd back to 1 MSS. */
+    uint32_t cwnd;             /* congestion window, bytes              */
+    uint32_t ssthresh;         /* slow-start threshold, bytes           */
+    int      dup_acks;         /* consecutive duplicate ACKs            */
+    int      in_fast_recovery; /* inflating cwnd during fast recovery   */
+    uint32_t recover;          /* snd_nxt snapshot at loss (NewReno)    */
+
     /* Receive sequence space. */
     uint32_t rcv_nxt; /* next sequence number we expect        */
     uint32_t irs;     /* peer's initial sequence number        */

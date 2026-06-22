@@ -297,6 +297,99 @@ static void test_bad_ip_checksum(struct stack *s) {
     CHECK(cap_count == 0, "packet with bad IP checksum is dropped");
 }
 
+static struct tcp_conn *find_conn(struct stack *s, uint16_t rport,
+                                  uint16_t lport) {
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn *c = &s->conns[i];
+        if (c->used && c->remote_port == rport && c->local_port == lport)
+            return c;
+    }
+    return NULL;
+}
+
+/* Drives the echo server's sender through slow start, fast retransmit + fast
+ * recovery on 3 duplicate ACKs, and an RTO-driven cwnd collapse — reading the
+ * server connection's congestion-control state directly. */
+static void test_tcp_congestion(struct stack *s) {
+    printf("test_tcp_congestion\n");
+    uint8_t seg[2048], pkt[2200];
+    static uint8_t mss_data[TCP_MSS];
+    memset(mss_data, 'x', sizeof(mss_data));
+    const uint32_t cisn = 200000;
+    const uint16_t cport = 51000;
+
+    /* Handshake. */
+    cap_reset();
+    size_t sl = build_tcp(cisn, 0, TCP_SYN, cport, APP_TCP_ECHO_PORT, NULL, 0, seg);
+    stack_input(s, pkt, build_ip(IP_PROTO_TCP, g_peer, g_local, seg, sl, pkt));
+    int idx = cap_find(IP_PROTO_TCP);
+    CHECK(idx >= 0, "cc: got SYN-ACK");
+    if (idx < 0)
+        return;
+    uint32_t sisn = ntohl(cap_tcp(idx)->seq);
+    sl = build_tcp(cisn + 1, sisn + 1, TCP_ACK, cport, APP_TCP_ECHO_PORT, NULL, 0, seg);
+    stack_input(s, pkt, build_ip(IP_PROTO_TCP, g_peer, g_local, seg, sl, pkt));
+
+    struct tcp_conn *sc = find_conn(s, cport, APP_TCP_ECHO_PORT);
+    CHECK(sc != NULL, "cc: server connection exists");
+    if (!sc)
+        return;
+    CHECK(sc->state == TCP_ESTABLISHED, "cc: established");
+    CHECK(sc->cwnd >= 10u * TCP_MSS && sc->cwnd <= 11u * TCP_MSS,
+          "cc: initial cwnd is ~IW10");
+
+    /* Slow start: client sends a segment, server echoes it, client ACKs the
+     * echo -> a new ACK should grow cwnd by one MSS. */
+    uint32_t cwnd0 = sc->cwnd;
+    sl = build_tcp(cisn + 1, sisn + 1, TCP_ACK | TCP_PSH, cport, APP_TCP_ECHO_PORT,
+                   mss_data, TCP_MSS, seg);
+    stack_input(s, pkt, build_ip(IP_PROTO_TCP, g_peer, g_local, seg, sl, pkt));
+    sl = build_tcp(cisn + 1 + TCP_MSS, sisn + 1 + TCP_MSS, TCP_ACK, cport,
+                   APP_TCP_ECHO_PORT, NULL, 0, seg);
+    stack_input(s, pkt, build_ip(IP_PROTO_TCP, g_peer, g_local, seg, sl, pkt));
+    CHECK(sc->cwnd == cwnd0 + TCP_MSS, "cc: slow start adds one MSS per ACK");
+
+    /* Put three echo segments in flight: send three in-order client segments.
+     * The server echoes each, so snd_nxt advances 3*MSS past snd_una. */
+    uint32_t e0 = sisn + 1 + TCP_MSS; /* server snd_una (first unacked echo) */
+    for (uint32_t k = 0; k < 3; k++) {
+        uint32_t cseq = cisn + 1 + TCP_MSS + k * TCP_MSS;
+        sl = build_tcp(cseq, e0, TCP_ACK | TCP_PSH, cport, APP_TCP_ECHO_PORT,
+                       mss_data, TCP_MSS, seg);
+        stack_input(s, pkt, build_ip(IP_PROTO_TCP, g_peer, g_local, seg, sl, pkt));
+    }
+    CHECK(sc->snd_una == e0 && sc->snd_nxt == e0 + 3 * TCP_MSS,
+          "cc: 3 MSS in flight");
+
+    /* Three duplicate (pure) ACKs all stuck at e0 -> fast retransmit. */
+    uint32_t cack_seq = cisn + 1 + 4 * TCP_MSS;
+    cap_reset();
+    for (int k = 0; k < 3; k++) {
+        sl = build_tcp(cack_seq, e0, TCP_ACK, cport, APP_TCP_ECHO_PORT, NULL, 0, seg);
+        stack_input(s, pkt, build_ip(IP_PROTO_TCP, g_peer, g_local, seg, sl, pkt));
+    }
+    CHECK(sc->in_fast_recovery, "cc: entered fast recovery on 3 dup ACKs");
+    CHECK(sc->ssthresh == 2u * TCP_MSS, "cc: ssthresh = max(flight/2, 2*MSS)");
+    CHECK(sc->cwnd == sc->ssthresh + 3u * TCP_MSS, "cc: cwnd inflated by 3 MSS");
+
+    /* The lost segment (seq e0) must have been retransmitted without waiting
+     * for the RTO. */
+    int saw_rtx = 0;
+    for (int i = 0; i < cap_count; i++) {
+        struct ipv4_hdr *ip = (struct ipv4_hdr *)cap_buf[i];
+        size_t hl = IPV4_HDR_LEN(ip);
+        struct tcp_hdr *t = (struct tcp_hdr *)(cap_buf[i] + hl);
+        size_t tlen = ntohs(ip->total_len) - hl - TCP_DATA_OFFSET(t);
+        if (ntohl(t->seq) == e0 && tlen > 0)
+            saw_rtx = 1;
+    }
+    CHECK(saw_rtx, "cc: fast retransmit resent the lost segment");
+
+    /* An RTO is the strongest loss signal: cwnd collapses to one MSS. */
+    stack_tick(s, 1000 + 200000);
+    CHECK(sc->cwnd == TCP_MSS, "cc: RTO collapses cwnd to 1 MSS");
+}
+
 int main(void) {
     g_local = inet_addr("10.0.0.2");
     g_peer = inet_addr("10.0.0.1");
@@ -312,6 +405,7 @@ int main(void) {
     test_udp_echo(&s);
     test_tcp_rst_closed_port(&s);
     test_tcp_lifecycle(&s);
+    test_tcp_congestion(&s);
     test_bad_ip_checksum(&s);
 
     printf("\n%d checks, %d failures\n", g_checks, g_fails);

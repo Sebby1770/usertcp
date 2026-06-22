@@ -6,6 +6,11 @@ All notable changes to usertcp are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **TCP Reno congestion control** (milestone 7, `src/tcp.c`): slow start
+  (IW=10·MSS, RFC 6928), congestion avoidance, fast retransmit + fast
+  recovery on three duplicate ACKs, and an RTO that collapses `cwnd` to one
+  MSS. The sender is now limited by `min(cwnd, rwnd)`. 11 new host-test
+  checks drive the full cwnd lifecycle.
 - **IPv4** layer: header parse + validation, checksum verify and generate,
   addressed-to-us filtering, fragment drop. (`src/stack.c`, `src/net.{c,h}`)
 - **ICMP** echo: replies to `ping 10.0.0.2` (milestone 1).
