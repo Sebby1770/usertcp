@@ -26,11 +26,11 @@ The full project roadmap (12 milestones, ending in HTTPS) is in
 | **IPv4** | header parse + validation, checksum verify/generate, addressed-to-us filtering, fragment drop |
 | **ICMP** | echo request → echo reply (`ping` works) |
 | **UDP** | demux by port, pseudo-header checksum, echo server on port 7 |
-| **TCP** | passive open (SYN/SYN-ACK/ACK), in-order reliable data, sliding send window honoring the peer's advertised window, **Reno congestion control** (slow start, congestion avoidance, fast retransmit + fast recovery), Go-Back-N retransmission, RFC 6298 RTO with Karn's algorithm, full close (FIN_WAIT_1/2, CLOSING, TIME_WAIT, CLOSE_WAIT, LAST_ACK), RST generation for unmatched segments, multi-connection demux by 4-tuple |
+| **TCP** | passive open (SYN/SYN-ACK/ACK), reliable data with **out-of-order reassembly**, sliding send window honoring the peer's advertised window, **Reno congestion control** (slow start, congestion avoidance, fast retransmit + fast recovery), Go-Back-N retransmission, RFC 6298 RTO with Karn's algorithm, full close (FIN_WAIT_1/2, CLOSING, TIME_WAIT, CLOSE_WAIT, LAST_ACK), RST generation for unmatched segments, multi-connection demux by 4-tuple |
 | **Apps** | TCP echo, HTTP/1.0 `GET` server |
 
-Not yet (see roadmap): SACK, window scaling, out-of-order reassembly,
-active open / sockets API, IPv6, TLS.
+Not yet (see roadmap): SACK, window scaling, active open / sockets API,
+IPv6, TLS.
 
 ## Architecture
 

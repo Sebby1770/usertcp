@@ -34,6 +34,7 @@ enum tcp_state {
 #define TCP_RCV_WND      65535
 #define TCP_MAX_CONNS    64
 #define TCP_MAX_LISTENERS 8
+#define TCP_OOO_SEGS     8   /* out-of-order reassembly slots per connection */
 
 /* 2*MSL TIME_WAIT. Real stacks use ~30-120s; shortened here so test and
  * demo cycles do not pile up dormant control blocks. */
@@ -87,6 +88,15 @@ struct tcp_conn {
     /* Receive sequence space. */
     uint32_t rcv_nxt; /* next sequence number we expect        */
     uint32_t irs;     /* peer's initial sequence number        */
+
+    /* Out-of-order reassembly: segments that arrive ahead of rcv_nxt (within
+     * the receive window) are parked here and delivered once the gap fills. */
+    struct {
+        int      used;
+        uint32_t seq;
+        uint16_t len;
+        uint8_t  data[TCP_MSS];
+    } ooo[TCP_OOO_SEGS];
 
     /* Send buffer: unacknowledged + unsent app bytes. sndbuf[0] carries
      * sequence number snd_data_seq; bytes are popped from the front as they

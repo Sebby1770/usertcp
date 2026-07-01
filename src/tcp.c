@@ -355,6 +355,51 @@ static void ack_update(struct tcp_conn *c, uint32_t ack, int *syn_acked,
     c->snd_una = ack;
 }
 
+/* Park an in-window segment that arrived ahead of rcv_nxt. */
+static void ooo_store(struct tcp_conn *c, uint32_t seq, const uint8_t *data,
+                      size_t dlen) {
+    if (dlen == 0 || dlen > TCP_MSS)
+        return;
+    for (int i = 0; i < TCP_OOO_SEGS; i++)
+        if (c->ooo[i].used && c->ooo[i].seq == seq)
+            return; /* already buffered */
+    for (int i = 0; i < TCP_OOO_SEGS; i++) {
+        if (!c->ooo[i].used) {
+            c->ooo[i].used = 1;
+            c->ooo[i].seq = seq;
+            c->ooo[i].len = (uint16_t)dlen;
+            memcpy(c->ooo[i].data, data, dlen);
+            return;
+        }
+    }
+    /* Table full: drop; the peer will retransmit. */
+}
+
+/* Deliver any parked segments that are now contiguous with rcv_nxt. Returns
+ * non-zero if anything was delivered. */
+static int ooo_drain(struct tcp_conn *c) {
+    int delivered = 0;
+    for (int progress = 1; progress;) {
+        progress = 0;
+        for (int i = 0; i < TCP_OOO_SEGS; i++) {
+            if (!c->ooo[i].used)
+                continue;
+            if (c->ooo[i].seq == c->rcv_nxt) {
+                if (c->listener && c->listener->on_recv)
+                    c->listener->on_recv(c, c->ooo[i].data, c->ooo[i].len,
+                                         c->user);
+                c->rcv_nxt += c->ooo[i].len;
+                c->ooo[i].used = 0;
+                delivered = 1;
+                progress = 1;
+            } else if (seq_lt(c->ooo[i].seq, c->rcv_nxt)) {
+                c->ooo[i].used = 0; /* stale / already delivered */
+            }
+        }
+    }
+    return delivered;
+}
+
 static void deliver_segment(struct tcp_conn *c, uint8_t flags, uint32_t seq,
                             const uint8_t *data, size_t dlen) {
     int can_recv = c->state == TCP_ESTABLISHED ||
@@ -363,7 +408,11 @@ static void deliver_segment(struct tcp_conn *c, uint8_t flags, uint32_t seq,
         return;
 
     if (seq != c->rcv_nxt) {
-        /* Out of order or already seen: re-ACK to nudge the peer. */
+        /* Not the next byte. If it is future data that fits in the window,
+         * park it for reassembly; then re-ACK to report our real rcv_nxt. */
+        if (seq_gt(seq, c->rcv_nxt) &&
+            seq_lt(seq, c->rcv_nxt + TCP_RCV_WND))
+            ooo_store(c, seq, data, dlen);
         tcp_output(c, c->snd_nxt, TCP_ACK, NULL, 0);
         return;
     }
@@ -398,6 +447,9 @@ static void deliver_segment(struct tcp_conn *c, uint8_t flags, uint32_t seq,
         default:
             break;
         }
+    } else if (ooo_drain(c)) {
+        /* This segment filled a gap: flush the now-contiguous parked data. */
+        got_something = 1;
     }
 
     if (got_something)

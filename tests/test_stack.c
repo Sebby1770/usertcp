@@ -390,6 +390,74 @@ static void test_tcp_congestion(struct stack *s) {
     CHECK(sc->cwnd == TCP_MSS, "cc: RTO collapses cwnd to 1 MSS");
 }
 
+/* Segments arriving out of order must be buffered and delivered in order once
+ * the gap is filled. */
+static void test_tcp_reassembly(struct stack *s) {
+    printf("test_tcp_reassembly\n");
+    uint8_t seg[2048], pkt[2048];
+    static uint8_t A[TCP_MSS], B[TCP_MSS];
+    memset(A, 'A', sizeof(A));
+    memset(B, 'B', sizeof(B));
+    const uint32_t cisn = 300000;
+    const uint16_t cport = 52000;
+
+    /* Handshake. */
+    cap_reset();
+    size_t sl = build_tcp(cisn, 0, TCP_SYN, cport, APP_TCP_ECHO_PORT, NULL, 0, seg);
+    stack_input(s, pkt, build_ip(IP_PROTO_TCP, g_peer, g_local, seg, sl, pkt));
+    int idx = cap_find(IP_PROTO_TCP);
+    CHECK(idx >= 0, "reasm: SYN-ACK");
+    if (idx < 0)
+        return;
+    uint32_t sisn = ntohl(cap_tcp(idx)->seq);
+    sl = build_tcp(cisn + 1, sisn + 1, TCP_ACK, cport, APP_TCP_ECHO_PORT, NULL, 0, seg);
+    stack_input(s, pkt, build_ip(IP_PROTO_TCP, g_peer, g_local, seg, sl, pkt));
+    struct tcp_conn *sc = find_conn(s, cport, APP_TCP_ECHO_PORT);
+    CHECK(sc != NULL, "reasm: connection exists");
+    if (!sc)
+        return;
+
+    /* Send the SECOND segment (B) first — out of order. */
+    cap_reset();
+    sl = build_tcp(cisn + 1 + TCP_MSS, sisn + 1, TCP_ACK | TCP_PSH, cport,
+                   APP_TCP_ECHO_PORT, B, TCP_MSS, seg);
+    stack_input(s, pkt, build_ip(IP_PROTO_TCP, g_peer, g_local, seg, sl, pkt));
+    CHECK(sc->rcv_nxt == cisn + 1, "reasm: OOO segment doesn't advance rcv_nxt");
+    int b_early = 0;
+    for (int i = 0; i < cap_count; i++) {
+        struct ipv4_hdr *ip = (struct ipv4_hdr *)cap_buf[i];
+        size_t hl = IPV4_HDR_LEN(ip);
+        struct tcp_hdr *t = (struct tcp_hdr *)(cap_buf[i] + hl);
+        size_t tl = ntohs(ip->total_len) - hl - TCP_DATA_OFFSET(t);
+        if (tl > 0 && cap_buf[i][hl + TCP_DATA_OFFSET(t)] == 'B')
+            b_early = 1;
+    }
+    CHECK(!b_early, "reasm: OOO data is buffered, not echoed early");
+
+    /* Send the FIRST segment (A) — fills the gap; both must now be delivered. */
+    cap_reset();
+    sl = build_tcp(cisn + 1, sisn + 1, TCP_ACK | TCP_PSH, cport,
+                   APP_TCP_ECHO_PORT, A, TCP_MSS, seg);
+    stack_input(s, pkt, build_ip(IP_PROTO_TCP, g_peer, g_local, seg, sl, pkt));
+    CHECK(sc->rcv_nxt == cisn + 1 + 2 * TCP_MSS,
+          "reasm: filling the gap advances rcv_nxt past both segments");
+    int saw_a = 0, saw_b = 0;
+    for (int i = 0; i < cap_count; i++) {
+        struct ipv4_hdr *ip = (struct ipv4_hdr *)cap_buf[i];
+        size_t hl = IPV4_HDR_LEN(ip);
+        struct tcp_hdr *t = (struct tcp_hdr *)(cap_buf[i] + hl);
+        size_t tl = ntohs(ip->total_len) - hl - TCP_DATA_OFFSET(t);
+        if (tl == 0)
+            continue;
+        uint8_t first = cap_buf[i][hl + TCP_DATA_OFFSET(t)];
+        if (first == 'A')
+            saw_a = 1;
+        if (first == 'B')
+            saw_b = 1;
+    }
+    CHECK(saw_a && saw_b, "reasm: both segments echoed in order after gap fill");
+}
+
 int main(void) {
     g_local = inet_addr("10.0.0.2");
     g_peer = inet_addr("10.0.0.1");
@@ -406,6 +474,7 @@ int main(void) {
     test_tcp_rst_closed_port(&s);
     test_tcp_lifecycle(&s);
     test_tcp_congestion(&s);
+    test_tcp_reassembly(&s);
     test_bad_ip_checksum(&s);
 
     printf("\n%d checks, %d failures\n", g_checks, g_fails);
