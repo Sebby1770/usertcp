@@ -13,13 +13,14 @@ adds the tests + debugging workflow that proves it works.
 - ✅ **M3** TCP three-way handshake
 - ✅ **M4** TCP data transfer (reliable, RTO per RFC 6298, Karn's algorithm)
 - ✅ **M5** TCP teardown (FIN dance, TIME_WAIT)
-- 🟡 **M6** Sliding window — send-side window is implemented; receive-side
-  reassembly + window-scaling option still to do
-- ⏳ **M7** Congestion control (Reno) ← next
+- 🟡 **M6** Sliding window — send-side window + receive-side out-of-order
+  reassembly done; window-scaling option still to do
+- ✅ **M7** Congestion control (Reno) — slow start, congestion avoidance,
+  fast retransmit + fast recovery on 3 dup ACKs, RTO collapse to 1 MSS
 - ✅ **M8** Multi-connection demux by 4-tuple (callback API; sockets-style
   `accept()` still to do)
 - ✅ **M9** HTTP/1.0 server (`GET` → static page)
-- ⏳ **M10** TLS → HTTPS
+- ⏳ **M10** TLS → HTTPS ← next
 - ⏳ **M11** Observability (pcap-out, structured tracing)
 
 The protocol core is unit-tested on the host with no TUN and no root

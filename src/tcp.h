@@ -34,6 +34,7 @@ enum tcp_state {
 #define TCP_RCV_WND      65535
 #define TCP_MAX_CONNS    64
 #define TCP_MAX_LISTENERS 8
+#define TCP_OOO_SEGS     8   /* out-of-order reassembly slots per connection */
 
 /* 2*MSL TIME_WAIT. Real stacks use ~30-120s; shortened here so test and
  * demo cycles do not pile up dormant control blocks. */
@@ -74,9 +75,28 @@ struct tcp_conn {
     uint32_t iss;     /* our initial send sequence number      */
     uint32_t snd_wnd; /* peer's advertised receive window      */
 
+    /* Congestion control (RFC 5681, TCP Reno). The sender is limited by
+     * min(cwnd, snd_wnd). cwnd grows in slow start until it reaches ssthresh,
+     * then more slowly in congestion avoidance; 3 duplicate ACKs trigger fast
+     * retransmit + fast recovery, and an RTO collapses cwnd back to 1 MSS. */
+    uint32_t cwnd;             /* congestion window, bytes              */
+    uint32_t ssthresh;         /* slow-start threshold, bytes           */
+    int      dup_acks;         /* consecutive duplicate ACKs            */
+    int      in_fast_recovery; /* inflating cwnd during fast recovery   */
+    uint32_t recover;          /* snd_nxt snapshot at loss (NewReno)    */
+
     /* Receive sequence space. */
     uint32_t rcv_nxt; /* next sequence number we expect        */
     uint32_t irs;     /* peer's initial sequence number        */
+
+    /* Out-of-order reassembly: segments that arrive ahead of rcv_nxt (within
+     * the receive window) are parked here and delivered once the gap fills. */
+    struct {
+        int      used;
+        uint32_t seq;
+        uint16_t len;
+        uint8_t  data[TCP_MSS];
+    } ooo[TCP_OOO_SEGS];
 
     /* Send buffer: unacknowledged + unsent app bytes. sndbuf[0] carries
      * sequence number snd_data_seq; bytes are popped from the front as they

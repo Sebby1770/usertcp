@@ -6,6 +6,15 @@ All notable changes to usertcp are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **TCP out-of-order reassembly** (milestone 6 receive side, `src/tcp.c`):
+  segments that arrive ahead of `rcv_nxt` but within the receive window are
+  parked in a small per-connection table and delivered in order once the gap
+  is filled (instead of being dropped). 6 new host-test checks.
+- **TCP Reno congestion control** (milestone 7, `src/tcp.c`): slow start
+  (IW=10·MSS, RFC 6928), congestion avoidance, fast retransmit + fast
+  recovery on three duplicate ACKs, and an RTO that collapses `cwnd` to one
+  MSS. The sender is now limited by `min(cwnd, rwnd)`. 11 new host-test
+  checks drive the full cwnd lifecycle.
 - **IPv4** layer: header parse + validation, checksum verify and generate,
   addressed-to-us filtering, fragment drop. (`src/stack.c`, `src/net.{c,h}`)
 - **ICMP** echo: replies to `ping 10.0.0.2` (milestone 1).
